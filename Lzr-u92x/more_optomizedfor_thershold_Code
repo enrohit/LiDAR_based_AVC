@@ -1,0 +1,144 @@
+import serial
+import time
+import numpy as np
+import datetime
+import os
+import struct
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SERIAL_PORT = 'COM4'
+BAUD_RATE = 460800
+POINTS_PER_SCAN = 274
+FOV_DEGREES = 96.0
+SAVE_DIRECTORY = "./scans"
+
+GRID_RESOLUTION = 0.05
+MIN_PERSISTENCE_RATIO = 0.20
+
+spatial_grid = {}
+total_frames_captured = 0
+
+# ==========================================
+# PRECOMPUTED ANGLES (ONCE)
+# ==========================================
+angles = np.linspace(
+    np.radians(-FOV_DEGREES / 2),
+    np.radians(FOV_DEGREES / 2),
+    POINTS_PER_SCAN
+)
+COS_ANGLES = np.cos(angles)
+SIN_ANGLES = np.sin(angles)
+
+# ==========================================
+# SAVE FILTERED PCD
+# ==========================================
+def save_filtered_pcd(grid_data, total_scans, output_folder):
+    if not grid_data or total_scans == 0:
+        print("[WARNING] No data to save.")
+        return
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    min_hits = max(1, int(total_scans * MIN_PERSISTENCE_RATIO))
+
+    final_points = [
+        (ix * GRID_RESOLUTION, iy * GRID_RESOLUTION, 0.0)
+        for (ix, iy), count in grid_data.items()
+        if count >= min_hits
+    ]
+
+    if not final_points:
+        print("[WARNING] No points passed filter.")
+        return
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_folder, f"lzr_filtered_{ts}.pcd")
+
+    with open(filename, "w") as f:
+        f.write(f"""# .PCD v0.7
+VERSION 0.7
+FIELDS x y z
+SIZE 4 4 4
+TYPE F F F
+COUNT 1 1 1
+WIDTH {len(final_points)}
+HEIGHT 1
+VIEWPOINT 0 0 0 1 0 0 0
+POINTS {len(final_points)}
+DATA ascii
+""")
+        for x, y, z in final_points:
+            f.write(f"{x:.4f} {y:.4f} {z:.4f}\n")
+
+    print(f"[SAVED] {len(final_points)} points → {filename}")
+
+# ==========================================
+# PROCESS SCAN (VECTORIZED)
+# ==========================================
+def process_scan(distances_mm):
+    global total_frames_captured
+
+    r = np.array(distances_mm, dtype=np.float32) / 1000.0
+
+    valid = (r > 0.1) & (r < 60.0)
+    r = r[valid]
+
+    if r.size == 0:
+        return
+
+    x = r * COS_ANGLES[valid]
+    y = r * SIN_ANGLES[valid]
+
+    ix = np.round(x / GRID_RESOLUTION).astype(np.int32)
+    iy = np.round(y / GRID_RESOLUTION).astype(np.int32)
+
+    cells = np.stack((ix, iy), axis=1)
+
+    # Unique grid cells per frame
+    unique_cells = np.unique(cells, axis=0)
+
+    for cx, cy in unique_cells:
+        key = (int(cx), int(cy))
+        spatial_grid[key] = spatial_grid.get(key, 0) + 1
+
+    total_frames_captured += 1
+
+    if total_frames_captured % 10 == 0:
+        print(f"Frame {total_frames_captured} | Cells tracked: {len(spatial_grid)}")
+
+# ==========================================
+# MAIN LOOP
+# ==========================================
+def run_recorder():
+    print("--- LZR U921 FAST FILTER ---")
+    print("Press Ctrl+C to stop\n")
+
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        buffer = b""
+        PACKET_SIZE = (POINTS_PER_SCAN * 2) + 10
+
+        while True:
+            buffer += ser.read(ser.in_waiting or 1)
+
+            while len(buffer) >= PACKET_SIZE:
+                if buffer[0] != 0x02:
+                    buffer = buffer[1:]
+                    continue
+
+                payload = buffer[4:4 + POINTS_PER_SCAN * 2]
+                distances = struct.unpack(f'>{POINTS_PER_SCAN}H', payload)
+                process_scan(distances)
+
+                buffer = buffer[PACKET_SIZE:]
+
+    except KeyboardInterrupt:
+        print("\n[STOP] Saving data...")
+    finally:
+        save_filtered_pcd(spatial_grid, total_frames_captured, SAVE_DIRECTORY)
+
+# ==========================================
+if __name__ == "__main__":
+    run_recorder()
